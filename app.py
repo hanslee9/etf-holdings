@@ -22,7 +22,7 @@ import datetime as dt
 
 import pandas as pd
 import streamlit as st
-from openpyxl.styles import Alignment
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="ETF/종목 리스트 업데이트", layout="wide")
@@ -568,6 +568,13 @@ def process_us_stock_sheet(label, ticker_df_func, progress_cb=None, limit=None) 
 #   - 일반 숫자(시가총액, 주가 등): 1000단위 콤마, 음수는 빨간색
 #   - 셀에 저장되는 실제 값은 그대로 숫자이며, 아래는 "표시 형식"만 지정한다
 #     (정렬·필터·수식은 서식과 무관하게 정상 동작)
+#
+# 엑셀 레이아웃 프로토콜 (모든 시트 공통)
+#   1행: 시트명과 동일한 제목 (굵게, 16pt)
+#   2행: 빈 줄
+#   3행: 헤더(컬럼명) - 굵게 + 자동 필터
+#   4행부터: 데이터, 4행 기준으로 틀고정(제목/빈줄/헤더가 스크롤해도 고정)
+#   열 너비: 각 컬럼 내용 길이에 맞춰 자동 조정
 # ----------------------------------------------------------------------------
 PERCENT_FORMAT = '0.00%;[Red]-0.00%'
 NUMBER_FORMAT = '#,##0;[Red]-#,##0'
@@ -577,6 +584,9 @@ PERCENT_KEYWORDS = ["주가", "TR", "PR", "배당", "분배율", "괴리율", "�
 # 서식을 적용하지 않을 텍스트성 컬럼(그대로 둠)
 TEXT_COLUMNS = {"종목코드", "ETF명", "종목명", "운용사", "브랜드", "자산구분",
                 "안전자산", "월배당", "주요 ETF\n(시총 1,000억↑)"}
+
+HEADER_ROW = 3        # 컬럼명이 들어가는 행
+DATA_START_ROW = 4    # 데이터가 시작되는 행
 
 
 def _is_percent_column(col_name: str) -> bool:
@@ -589,23 +599,56 @@ def _is_percent_column(col_name: str) -> bool:
     return any(kw in col_name for kw in PERCENT_KEYWORDS)
 
 
-def apply_number_formats(writer, result_sheets: dict):
-    """저장된 각 시트에 대해 컬럼별로 %/콤마 표시 형식을 적용한다."""
-    for sheet_name, df in result_sheets.items():
-        ws = writer.sheets[sheet_name[:31]]
-        for col_idx, col_name in enumerate(df.columns, start=1):
-            if col_name in TEXT_COLUMNS:
-                continue
-            if not pd.api.types.is_numeric_dtype(df[col_name]):
-                continue
+def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame):
+    """시트 하나를 제목/빈줄/헤더/데이터 구조로 작성하고,
+    숫자 서식·헤더 굵게·자동 필터·틀고정·열 너비까지 한 번에 적용한다."""
+    safe_name = sheet_name[:31]
+    # 실제 데이터는 DATA_START_ROW부터 쓰기 위해 헤더 없이 먼저 기록
+    df.to_excel(writer, sheet_name=safe_name, index=False, header=False, startrow=DATA_START_ROW - 1)
+    ws = writer.sheets[safe_name]
 
-            col_letter = get_column_letter(col_idx)
-            fmt = PERCENT_FORMAT if _is_percent_column(col_name) else NUMBER_FORMAT
+    n_cols = len(df.columns)
 
-            # 헤더(1행) 제외, 데이터 행부터 서식 적용
-            for row_idx in range(2, len(df) + 2):
-                cell = ws[f"{col_letter}{row_idx}"]
-                cell.number_format = fmt
+    # 1행: 제목 (시트명과 동일, 굵게 16pt)
+    title_cell = ws.cell(row=1, column=1, value=sheet_name)
+    title_cell.font = Font(bold=True, size=16)
+
+    # 3행: 헤더(컬럼명), 굵게
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        header_cell = ws.cell(row=HEADER_ROW, column=col_idx, value=col_name)
+        header_cell.font = Font(bold=True)
+
+    # 자동 필터: 헤더 행 전체 범위에 적용
+    last_col_letter = get_column_letter(n_cols)
+    last_row = DATA_START_ROW - 1 + len(df)
+    ws.auto_filter.ref = f"A{HEADER_ROW}:{last_col_letter}{last_row}"
+
+    # 틀고정: 데이터 시작 행(4행) 위쪽 전체 고정
+    ws.freeze_panes = f"A{DATA_START_ROW}"
+
+    # 숫자 서식(%, 콤마) 적용
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        if col_name in TEXT_COLUMNS:
+            continue
+        if not pd.api.types.is_numeric_dtype(df[col_name]):
+            continue
+        col_letter = get_column_letter(col_idx)
+        fmt = PERCENT_FORMAT if _is_percent_column(col_name) else NUMBER_FORMAT
+        for row_idx in range(DATA_START_ROW, last_row + 1):
+            ws[f"{col_letter}{row_idx}"].number_format = fmt
+
+    # 열 너비: 헤더와 데이터 내용 중 가장 긴 길이에 맞춰 자동 조정
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        col_letter = get_column_letter(col_idx)
+        header_len = max((len(line) for line in str(col_name).split("\n")), default=0)
+        try:
+            data_len = df[col_name].astype(str).map(len).max()
+        except Exception:
+            data_len = 0
+        if pd.isna(data_len):
+            data_len = 0
+        width = max(header_len, int(data_len)) + 4  # 여유폭
+        ws.column_dimensions[col_letter].width = min(max(width, 8), 40)
 
 
 # ----------------------------------------------------------------------------
@@ -706,8 +749,7 @@ if run:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             for sheet_name, df in result_sheets.items():
-                df.to_excel(writer, sheet_name=sheet_name[:31], index=False)
-            apply_number_formats(writer, result_sheets)
+                write_formatted_sheet(writer, sheet_name, df)
         buf.seek(0)
 
         st.download_button(
