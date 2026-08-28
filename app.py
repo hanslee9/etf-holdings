@@ -155,14 +155,42 @@ def ensure_kis_auth():
     return {"access_token": access_token, "app_key": app_key, "app_secret": app_secret}
 
 
+class _KisRateLimiter:
+    """KIS 초당 호출 제한(개인 10건/초) 안에서 여러 요청을 병렬로 보내기 위한
+    간단한 토큰 버킷 방식 속도 제한기. 여러 스레드가 공유해서 사용한다."""
+    def __init__(self, max_per_second: int):
+        import threading
+        self.max_per_second = max_per_second
+        self.lock = threading.Lock()
+        self.timestamps = []
+
+    def wait(self):
+        while True:
+            with self.lock:
+                now = time.time()
+                self.timestamps = [t for t in self.timestamps if now - t < 1.0]
+                if len(self.timestamps) < self.max_per_second:
+                    self.timestamps.append(now)
+                    return
+                sleep_time = 1.0 - (now - self.timestamps[0])
+            time.sleep(max(sleep_time, 0.01))
+
+
 def fetch_kis_market_caps(access_token: str, app_key: str, app_secret: str,
-                           tickers: list, delay: float = 0.15, progress_cb=None) -> dict:
+                           tickers: list, max_workers: int = 8, max_per_second: int = 8,
+                           progress_cb=None) -> dict:
     """
-    KIS Open API로 전 종목 시가총액(억원)을 조회한다.
+    KIS Open API로 전 종목 시가총액(억원)을 병렬로 조회한다.
     '국내주식 현재가 시세' API(FHKST01010100)의 hts_avls 필드가
     이미 억원 단위로 계산된 시가총액이라 별도 계산 불필요 (Colab 검증 완료).
+
+    순차 호출은 개별 요청의 네트워크 왕복 시간(0.5~1초)이 그대로 누적되어
+    1000종목 이상에서 20분 이상 걸리는 문제가 있어(2026-08-28 로컬 실행에서 확인),
+    ThreadPoolExecutor + 속도 제한기로 동시에 여러 요청을 보내 단축한다.
+    max_per_second는 KIS 개인 계좌 제한(초당 10건)보다 낮게 잡아 안전하게 운영한다.
     """
     import requests
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-price"
     headers = {
@@ -173,24 +201,32 @@ def fetch_kis_market_caps(access_token: str, app_key: str, app_secret: str,
         "tr_id": "FHKST01010100",
     }
 
+    limiter = _KisRateLimiter(max_per_second)
     market_caps = {}
     total = len(tickers)
+    done_count = [0]
 
-    for i, ticker in enumerate(tickers):
+    def fetch_one(ticker):
+        limiter.wait()
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=5)
             resp.raise_for_status()
             data = resp.json()
             avls = data.get("output", {}).get("hts_avls")
-            market_caps[ticker] = int(avls) if avls not in (None, "") else None
+            return ticker, (int(avls) if avls not in (None, "") else None)
         except Exception:
-            market_caps[ticker] = None
+            return ticker, None
 
-        time.sleep(delay)
-
-        if progress_cb and (i + 1) % 50 == 0:
-            progress_cb(min(0.75 + 0.20 * (i + 1) / total, 0.95), f"시가총액 조회 중... {i + 1}/{total}")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_one, t): t for t in tickers}
+        for future in as_completed(futures):
+            ticker, cap = future.result()
+            market_caps[ticker] = cap
+            done_count[0] += 1
+            if progress_cb and done_count[0] % 50 == 0:
+                progress_cb(min(0.75 + 0.20 * done_count[0] / total, 0.95),
+                            f"시가총액 조회 중... {done_count[0]}/{total}")
 
     return market_caps
 
