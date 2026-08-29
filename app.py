@@ -4,22 +4,26 @@ ETF/종목 리스트 자동 업데이트 Streamlit 앱  (pykrx + KIS API 버전)
 
 - 1번 시트: 국내 상장 ETF 전체 (pykrx + KIS API 시가총액)
 - 2번 시트: KOSPI200 종목 (pykrx)
+- 3번 시트: 미국 상장 ETF 전체(상위100) (TradingView 스크래핑 + yfinance)
 - 4번 시트: 미국 S&P500 종목 (위키피디아 + yfinance)
 - 5번 시트: 미국 나스닥100 종목 (위키피디아 + yfinance)
 - 6번 시트: 미국 배당 ETF(SCHD) 구성종목 (SEC N-PORT + OpenFIGI + yfinance)
-- 3번 시트(미국 상장 ETF 전체)는 무료 소스 한계로 이번 버전에서 자동화하지 않음
 
 핵심 설계:
 - 국내(pykrx) 파트는 "종목별 반복 호출"을 쓰지 않고,
   기준일 여러 개(오늘/1개월전/6개월전/YTD시작/1년전 영업일)의 "전종목 스냅샷"을
   각각 1회씩만 호출한 뒤 종목코드로 매칭 → 훨씬 빠르고 서버 부담이 적음
 - 국내 ETF 시가총액은 pykrx가 제공하지 않아(2026-08-28 확인) KIS Open API로 별도 조회
+- 미국 상장 ETF 전체(3번)는 TradingView의 무료 정적 페이지(tradingview.com/markets/etfs/funds-usa/)가
+  로그인 없이 AUM 기준 정렬 상위 100개까지 서버사이드 렌더링으로 제공함을 확인(2026-08-29),
+  이를 스크래핑해 사용. 100개 초과는 로그인 필요라 자동화 범위에서 제외.
 """
 
 import os
 import io
 import time
 import json
+import re
 import datetime as dt
 
 import pandas as pd
@@ -155,42 +159,14 @@ def ensure_kis_auth():
     return {"access_token": access_token, "app_key": app_key, "app_secret": app_secret}
 
 
-class _KisRateLimiter:
-    """KIS 초당 호출 제한(개인 10건/초) 안에서 여러 요청을 병렬로 보내기 위한
-    간단한 토큰 버킷 방식 속도 제한기. 여러 스레드가 공유해서 사용한다."""
-    def __init__(self, max_per_second: int):
-        import threading
-        self.max_per_second = max_per_second
-        self.lock = threading.Lock()
-        self.timestamps = []
-
-    def wait(self):
-        while True:
-            with self.lock:
-                now = time.time()
-                self.timestamps = [t for t in self.timestamps if now - t < 1.0]
-                if len(self.timestamps) < self.max_per_second:
-                    self.timestamps.append(now)
-                    return
-                sleep_time = 1.0 - (now - self.timestamps[0])
-            time.sleep(max(sleep_time, 0.01))
-
-
 def fetch_kis_market_caps(access_token: str, app_key: str, app_secret: str,
-                           tickers: list, max_workers: int = 8, max_per_second: int = 8,
-                           progress_cb=None) -> dict:
+                           tickers: list, delay: float = 0.15, progress_cb=None) -> dict:
     """
-    KIS Open API로 전 종목 시가총액(억원)을 병렬로 조회한다.
+    KIS Open API로 전 종목 시가총액(억원)을 조회한다.
     '국내주식 현재가 시세' API(FHKST01010100)의 hts_avls 필드가
     이미 억원 단위로 계산된 시가총액이라 별도 계산 불필요 (Colab 검증 완료).
-
-    순차 호출은 개별 요청의 네트워크 왕복 시간(0.5~1초)이 그대로 누적되어
-    1000종목 이상에서 20분 이상 걸리는 문제가 있어(2026-08-28 로컬 실행에서 확인),
-    ThreadPoolExecutor + 속도 제한기로 동시에 여러 요청을 보내 단축한다.
-    max_per_second는 KIS 개인 계좌 제한(초당 10건)보다 낮게 잡아 안전하게 운영한다.
     """
     import requests
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-price"
     headers = {
@@ -201,32 +177,24 @@ def fetch_kis_market_caps(access_token: str, app_key: str, app_secret: str,
         "tr_id": "FHKST01010100",
     }
 
-    limiter = _KisRateLimiter(max_per_second)
     market_caps = {}
     total = len(tickers)
-    done_count = [0]
 
-    def fetch_one(ticker):
-        limiter.wait()
+    for i, ticker in enumerate(tickers):
         params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=5)
             resp.raise_for_status()
             data = resp.json()
             avls = data.get("output", {}).get("hts_avls")
-            return ticker, (int(avls) if avls not in (None, "") else None)
+            market_caps[ticker] = int(avls) if avls not in (None, "") else None
         except Exception:
-            return ticker, None
+            market_caps[ticker] = None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_one, t): t for t in tickers}
-        for future in as_completed(futures):
-            ticker, cap = future.result()
-            market_caps[ticker] = cap
-            done_count[0] += 1
-            if progress_cb and done_count[0] % 50 == 0:
-                progress_cb(min(0.75 + 0.20 * done_count[0] / total, 0.95),
-                            f"시가총액 조회 중... {done_count[0]}/{total}")
+        time.sleep(delay)
+
+        if progress_cb and (i + 1) % 50 == 0:
+            progress_cb(min(0.75 + 0.20 * (i + 1) / total, 0.95), f"시가총액 조회 중... {i + 1}/{total}")
 
     return market_caps
 
@@ -390,6 +358,102 @@ def build_domestic_etf_sheet(base_date: dt.date, progress_cb=None, kis_auth=None
     if progress_cb:
         progress_cb(1.0, "완료")
     return pd.DataFrame(rows)[ETF_COLS]
+
+
+# ----------------------------------------------------------------------------
+# 3번 시트: 미국 상장 ETF 전체(상위100)
+#
+# TradingView의 무료 정적 페이지(tradingview.com/markets/etfs/funds-usa/)는
+# 로그인 없이 AUM 기준 정렬 상위 100개까지 서버사이드 HTML로 제공함을
+# 실제 fetch로 확인(2026-08-29). 100개를 초과하는 부분은 로그인이 필요해
+# 이 자동화 범위에서는 제외한다(다음 세션에서 유료/로그인 경로 검토 가능).
+# ----------------------------------------------------------------------------
+_TRADINGVIEW_US_ETF_URL = "https://www.tradingview.com/markets/etfs/funds-usa/"
+
+
+def _parse_aum_to_mil(aum_str: str):
+    """'1.04 T USD', '888.84 B USD', '153.08 M USD' 등을 Mil(백만달러) 단위 숫자로 변환.
+    공백 유무가 일정하지 않아 \\s* 로 유연하게 매칭한다."""
+    if not aum_str:
+        return None
+    match = re.match(r"([\d.]+)\s*([TBM])\s*USD", aum_str.strip())
+    if not match:
+        return None
+    value, unit = match.groups()
+    multiplier = {"T": 1_000_000, "B": 1_000, "M": 1}
+    return float(value) * multiplier[unit]
+
+
+def get_us_etf_top100_raw() -> pd.DataFrame:
+    """TradingView 정적 페이지를 스크래핑해 티커/종목명/AUM(Mil)을 반환.
+    pd.read_html은 티커+종목명이 한 셀에 뭉쳐 나와(예: 'VOOVanguard...')
+    잘못 분리되는 문제가 있어(Colab에서 확인), BeautifulSoup으로 <a> 태그를
+    직접 읽어 티커/종목명을 분리한다."""
+    import requests
+    from bs4 import BeautifulSoup
+
+    resp = requests.get(_TRADINGVIEW_US_ETF_URL, headers=_WEB_HEADERS, timeout=15)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    table = soup.find("table")
+    if table is None:
+        raise RuntimeError("TradingView 페이지에서 ETF 표를 찾지 못했습니다. 페이지 구조가 바뀌었을 수 있습니다.")
+
+    rows = table.find("tbody").find_all("tr")
+
+    data = []
+    for row in rows:
+        cells = row.find_all("td")
+        if len(cells) < 2:
+            continue
+        links = cells[0].find_all("a")
+        ticker = links[0].get_text(strip=True) if len(links) > 0 else None
+        name = links[1].get_text(strip=True) if len(links) > 1 else None
+        aum_str = cells[1].get_text(strip=True)
+
+        if not ticker:
+            continue
+
+        data.append({
+            "종목코드": ticker,
+            "종목명": name,
+            "시가총액(Mil)": _parse_aum_to_mil(aum_str),
+        })
+
+    if not data:
+        raise RuntimeError("TradingView ETF 표를 파싱했으나 결과가 비어 있습니다.")
+
+    return pd.DataFrame(data)
+
+
+def process_us_etf_top100_sheet(progress_cb=None) -> pd.DataFrame:
+    """미국 상장 ETF 상위 100개(AUM 기준)에 대해
+    시가총액은 TradingView 스크래핑값을, 현재가/PR/배당수익률은 yfinance로 채운다."""
+    if progress_cb:
+        progress_cb(0.05, "TradingView에서 ETF 목록(AUM 정렬 상위100) 가져오는 중...")
+    base_df = get_us_etf_top100_raw()
+
+    rows = []
+    n = len(base_df)
+    for i, r in base_df.iterrows():
+        ticker = r["종목코드"]
+        metrics = calc_us_stock_metrics(ticker, skip_market_cap=True)
+        metrics["종목코드"] = ticker
+        metrics["종목명"] = r["종목명"]
+        metrics["시가총액(Mil)"] = r["시가총액(Mil)"]  # yfinance 대신 TradingView AUM 사용
+        rows.append(metrics)
+        if progress_cb:
+            progress_cb(min((i + 1) / n, 1.0), f"미국 상장 ETF(상위100) {i + 1}/{n}")
+        time.sleep(0.05)  # yfinance 과호출 방지
+
+    out = pd.DataFrame(rows)
+    for c in STOCK_COLS_US:
+        if c not in out.columns:
+            out[c] = None
+    out = out[STOCK_COLS_US]
+    # TradingView가 이미 AUM 내림차순으로 정렬해 준 순서를 그대로 유지
+    return out
 
 
 # ----------------------------------------------------------------------------
@@ -651,10 +715,17 @@ def get_schd_holdings() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def calc_us_stock_metrics(ticker: str) -> dict:
+def calc_us_stock_metrics(ticker: str, skip_market_cap: bool = False) -> dict:
     """yfinance로 미국 종목의 시가총액/주가/PR/배당수익률 계산.
     시가총액은 fast_info를 우선 사용(info보다 안정적, Colab에서 결측 9→0건으로 개선 확인),
-    실패 시 info로 폴백한다."""
+    실패 시 info로 폴백한다.
+
+    skip_market_cap=True면 시가총액 계산(무거운 t.info 호출)을 생략한다.
+    (3번 시트처럼 별도 스크래핑한 AUM을 쓸 때, 100종목 연속 호출 시 t.info가
+    야후 파이낸스 rate limit에 걸려 대량 실패하는 문제를 Colab에서 확인 후 추가한 옵션.)
+
+    오늘자 장중/미체결로 종가가 NaN인 마지막 행이 있으면 결과가 전부 NaN이 되는
+    버그가 있어(Colab에서 확인), dropna로 유효한 마지막 종가를 사용하도록 수정했다."""
     import yfinance as yf
 
     try:
@@ -664,6 +735,10 @@ def calc_us_stock_metrics(ticker: str) -> dict:
             return {}
 
         hist = hist.sort_index()
+        hist = hist.dropna(subset=["Close"])  # 오늘자 미체결(NaN) 행 제거
+        if hist.empty:
+            return {}
+
         last_close = hist["Close"].iloc[-1]
         last_date = hist.index[-1]
 
@@ -701,20 +776,21 @@ def calc_us_stock_metrics(ticker: str) -> dict:
             pass
 
         market_cap = None
-        try:
-            fi = t.fast_info
-            raw_cap = fi.get("marketCap") or fi.get("market_cap")
-            if raw_cap:
-                market_cap = round(raw_cap / 1e6)
-        except Exception:
-            pass
-        if market_cap is None:
+        if not skip_market_cap:
             try:
-                info = t.info
-                raw_cap = info.get("marketCap")
-                market_cap = round(raw_cap / 1e6) if raw_cap else None
+                fi = t.fast_info
+                raw_cap = fi.get("marketCap") or fi.get("market_cap")
+                if raw_cap:
+                    market_cap = round(raw_cap / 1e6)
             except Exception:
                 pass
+            if market_cap is None:
+                try:
+                    info = t.info
+                    raw_cap = info.get("marketCap")
+                    market_cap = round(raw_cap / 1e6) if raw_cap else None
+                except Exception:
+                    pass
 
         return {
             "시가총액(Mil)": market_cap,
@@ -838,13 +914,14 @@ def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame):
 # Streamlit UI
 # ----------------------------------------------------------------------------
 st.title("📊 ETF/종목 리스트 자동 업데이트 (pykrx + KIS API 버전)")
-st.caption("국내 ETF / KOSPI200 / S&P500 / 나스닥100 / SCHD 구성종목")
+st.caption("국내 ETF / KOSPI200 / 미국 상장 ETF(상위100) / S&P500 / 나스닥100 / SCHD 구성종목")
 
 st.markdown(
     """
 **데이터 소스**
 - 국내(1, 2번): `pykrx` (전종목 일괄조회, 종목별 반복호출 없음) + 국내 ETF 시가총액은 KIS Open API
-- 미국(4, 5, 6번): `yfinance` + 위키피디아 / SEC EDGAR 구성종목표
+- 미국 상장 ETF(3번): TradingView 정적 페이지 스크래핑(AUM 정렬 상위100, 로그인 불필요) + yfinance
+- 미국 종목(4, 5, 6번): `yfinance` + 위키피디아 / SEC EDGAR 구성종목표
 - PR(주가수익률) 1개월/6개월/YTD/1년, 최근 1년 배당수익률을 각각 컬럼으로 제공
 """
 )
@@ -862,10 +939,10 @@ base_date = st.date_input("기준일", value=dt.date.today() - dt.timedelta(days
 
 sheet_options = st.multiselect(
     "업데이트할 시트 선택",
-    ["1. 국내 상장 ETF", "2. KOSPI200종목",
+    ["1. 국내 상장 ETF", "2. KOSPI200종목", "3. 미국 상장 ETF(상위100)",
      "4. 미국S&P500종목", "5. 미국나스닥100종목", "6. 미국 배당 ETF(SCHD)"],
-    default=["1. 국내 상장 ETF", "2. KOSPI200종목", "4. 미국S&P500종목",
-              "5. 미국나스닥100종목", "6. 미국 배당 ETF(SCHD)"],
+    default=["1. 국내 상장 ETF", "2. KOSPI200종목", "3. 미국 상장 ETF(상위100)",
+              "4. 미국S&P500종목", "5. 미국나스닥100종목", "6. 미국 배당 ETF(SCHD)"],
 )
 
 run = st.button("🚀 업데이트 실행", type="primary")
@@ -889,6 +966,21 @@ if run:
             st.success(f"국내 ETF {len(out)}종목 완료")
         except Exception as e:
             st.error(f"국내 ETF 수집 실패: {e}")
+
+    # ---------------- 미국 상장 ETF(상위100) : "국내 상장 ETF" 바로 다음 시트 ----------------
+    if "3. 미국 상장 ETF(상위100)" in sheet_options:
+        st.info("미국 상장 ETF(상위100) 처리 중...")
+        bar = st.progress(0.0)
+        status = st.empty()
+        try:
+            def cb(p, msg):
+                bar.progress(p)
+                status.text(msg)
+            out = process_us_etf_top100_sheet(progress_cb=cb)
+            result_sheets["미국 상장 ETF(상위100)"] = out
+            st.success(f"미국 상장 ETF(상위100) {len(out)}종목 완료")
+        except Exception as e:
+            st.error(f"미국 상장 ETF(상위100) 수집 실패: {e}")
 
     # ---------------- KOSPI200 ----------------
     if "2. KOSPI200종목" in sheet_options and not login_ok:
