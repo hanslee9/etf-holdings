@@ -357,7 +357,9 @@ def build_domestic_etf_sheet(base_date: dt.date, progress_cb=None, kis_auth=None
 
     if progress_cb:
         progress_cb(1.0, "완료")
-    return pd.DataFrame(rows)[ETF_COLS]
+    out = pd.DataFrame(rows)[ETF_COLS]
+    out = out.sort_values("시가총액(억원)", ascending=False, na_position="last").reset_index(drop=True)
+    return out
 
 
 # ----------------------------------------------------------------------------
