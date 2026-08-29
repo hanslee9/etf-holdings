@@ -861,9 +861,52 @@ def _is_percent_column(col_name: str) -> bool:
     return any(kw in col_name for kw in PERCENT_KEYWORDS)
 
 
-def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame):
+# ----------------------------------------------------------------------------
+# 종목코드 하이퍼링크
+#
+# 시트별로 가장 정보가 풍부한 전문 사이트로 연결한다(2026-08-29 Colab 검증 완료).
+#   - 국내 ETF: etfcheck.co.kr (ETF 전문 사이트, 네이버증권보다 정보가 상세)
+#   - 국내 개별종목(KOSPI200): 네이버증권
+#   - 미국 개별종목(S&P500/나스닥100/SCHD 구성종목): stockanalysis.com/stocks/
+#   - 미국 ETF(상장ETF 상위100): stockanalysis.com/etf/
+# ----------------------------------------------------------------------------
+from urllib.parse import quote as _urlquote
+
+
+def link_etfcheck(code: str) -> str:
+    return f"https://www.etfcheck.co.kr/mobile/etpitem/{code}/basic/{_urlquote('개요')}"
+
+
+def link_naver(code: str) -> str:
+    return f"https://finance.naver.com/item/main.naver?code={code}"
+
+
+def link_stockanalysis_stock(ticker: str) -> str:
+    return f"https://stockanalysis.com/stocks/{str(ticker).lower()}/"
+
+
+def link_stockanalysis_etf(ticker: str) -> str:
+    return f"https://stockanalysis.com/etf/{str(ticker).lower()}/"
+
+
+# 시트명 -> 링크 생성 함수 매핑 (write_formatted_sheet 호출 시 사용)
+SHEET_LINK_FUNCS = {
+    "국내 상장 ETF": link_etfcheck,
+    "KOSPI200종목": link_naver,
+    "미국 상장 ETF(상위100)": link_stockanalysis_etf,
+    "미국S&P500종목": link_stockanalysis_stock,
+    "미국나스닥100종목": link_stockanalysis_stock,
+    "미국 배당 ETF(SCHD)": link_stockanalysis_stock,  # 구성종목은 개별 주식이므로 stocks/ 사용
+}
+
+# 하이퍼링크를 적용할 컬럼명(첫 번째로 매칭되는 컬럼에 적용)
+LINK_TARGET_COLUMNS = ["종목코드"]
+
+
+def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame, link_func=None):
     """시트 하나를 제목/빈줄/헤더/데이터 구조로 작성하고,
-    숫자 서식·헤더 굵게·자동 필터·틀고정·열 너비까지 한 번에 적용한다."""
+    숫자 서식·헤더 굵게·자동 필터·틀고정·열 너비까지 한 번에 적용한다.
+    link_func이 주어지면 종목코드 컬럼 셀에 하이퍼링크를 건다."""
     safe_name = sheet_name[:31]
     df.to_excel(writer, sheet_name=safe_name, index=False, header=False, startrow=DATA_START_ROW - 1)
     ws = writer.sheets[safe_name]
@@ -886,6 +929,26 @@ def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame):
 
     # 틀고정: 데이터 시작 행(4행) 위쪽 전체 고정
     ws.freeze_panes = f"A{DATA_START_ROW}"
+
+    # 종목코드 컬럼에 하이퍼링크 적용
+    if link_func is not None:
+        link_col_idx = None
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            if col_name in LINK_TARGET_COLUMNS:
+                link_col_idx = col_idx
+                break
+        if link_col_idx is not None:
+            link_col_letter = get_column_letter(link_col_idx)
+            for row_idx, code in zip(range(DATA_START_ROW, last_row + 1), df.iloc[:, link_col_idx - 1]):
+                if pd.isna(code):
+                    continue
+                try:
+                    url = link_func(str(code))
+                except Exception:
+                    continue
+                cell = ws[f"{link_col_letter}{row_idx}"]
+                cell.hyperlink = url
+                cell.font = Font(color="0563C1", underline="single")
 
     # 숫자 서식(%, 콤마) 적용
     for col_idx, col_name in enumerate(df.columns, start=1):
@@ -1030,7 +1093,7 @@ if run:
         buf = io.BytesIO()
         with pd.ExcelWriter(buf, engine="openpyxl") as writer:
             for sheet_name, df in result_sheets.items():
-                write_formatted_sheet(writer, sheet_name, df)
+                write_formatted_sheet(writer, sheet_name, df, link_func=SHEET_LINK_FUNCS.get(sheet_name))
         buf.seek(0)
 
         st.download_button(
