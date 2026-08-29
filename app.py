@@ -1,23 +1,25 @@
 # -*- coding: utf-8 -*-
 """
-ETF/종목 리스트 자동 업데이트 Streamlit 앱  (pykrx 단독 버전)
+ETF/종목 리스트 자동 업데이트 Streamlit 앱  (pykrx + KIS API 버전)
 
-- 1번 시트: 국내 상장 ETF 전체 (pykrx)
+- 1번 시트: 국내 상장 ETF 전체 (pykrx + KIS API 시가총액)
 - 2번 시트: KOSPI200 종목 (pykrx)
 - 4번 시트: 미국 S&P500 종목 (위키피디아 + yfinance)
 - 5번 시트: 미국 나스닥100 종목 (위키피디아 + yfinance)
-- 6번 시트: 미국 배당 ETF(SCHD) 구성종목 (Schwab 홀딩스 + yfinance)
+- 6번 시트: 미국 배당 ETF(SCHD) 구성종목 (SEC N-PORT + OpenFIGI + yfinance)
 - 3번 시트(미국 상장 ETF 전체)는 무료 소스 한계로 이번 버전에서 자동화하지 않음
 
 핵심 설계:
 - 국내(pykrx) 파트는 "종목별 반복 호출"을 쓰지 않고,
-  기준일 여러 개(오늘/6개월전/YTD시작/1년전 영업일)의 "전종목 스냅샷"을
+  기준일 여러 개(오늘/1개월전/6개월전/YTD시작/1년전 영업일)의 "전종목 스냅샷"을
   각각 1회씩만 호출한 뒤 종목코드로 매칭 → 훨씬 빠르고 서버 부담이 적음
+- 국내 ETF 시가총액은 pykrx가 제공하지 않아(2026-08-28 확인) KIS Open API로 별도 조회
 """
 
 import os
 import io
 import time
+import json
 import datetime as dt
 
 import pandas as pd
@@ -40,18 +42,16 @@ USE_ENV_FILE = True  # 테스트 기간: True(.env 자동 로드) / 배포·공�
 
 def ensure_krx_login() -> bool:
     """KRX_ID / KRX_PW 환경변수를 설정. 성공 여부를 반환."""
-    # 1) .env 파일에서 로드 시도 (python-dotenv가 있으면 사용)
     if USE_ENV_FILE:
         try:
             from dotenv import load_dotenv
-            load_dotenv()  # 같은 폴더의 .env 파일을 읽어 os.environ에 채워줌
+            load_dotenv()
         except ImportError:
-            pass  # python-dotenv 미설치 시 무시하고 아래 화면 입력으로 진행
+            pass
 
         if os.environ.get("KRX_ID") and os.environ.get("KRX_PW"):
             return True
 
-    # 2) .env가 없거나 비어있으면 화면에서 입력받기
     with st.sidebar:
         st.subheader("🔐 KRX 로그인")
         st.caption("2026-01-27부터 KRX 정보데이터시스템 데이터 조회에 로그인이 필요합니다. (무료 회원가입)")
@@ -67,23 +67,150 @@ def ensure_krx_login() -> bool:
 
 
 # ----------------------------------------------------------------------------
+# KIS(한국투자증권) Open API 인증
+#
+# 국내 ETF 시가총액 조회에 사용(pykrx는 ETF 시가총액을 제공하지 않음, Colab 검증 완료).
+# KIS 정책상 "접근토큰은 1일 1회 발급 원칙"이라, 발급받은 토큰을 파일로 캐시해
+# 24시간 이내에는 재발급 없이 재사용한다. (2026-08-28 KIS 안내 반영)
+# ----------------------------------------------------------------------------
+_KIS_TOKEN_CACHE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), ".kis_token_cache.json"
+)
+
+
+def get_kis_access_token(app_key: str, app_secret: str) -> str:
+    """KIS Open API 접근토큰 신규 발급 (실제 발급 요청 - 하루 1회만 호출되어야 함)"""
+    import requests
+
+    url = "https://openapi.koreainvestment.com:9443/oauth2/tokenP"
+    headers = {"content-type": "application/json"}
+    body = {
+        "grant_type": "client_credentials",
+        "appkey": app_key,
+        "appsecret": app_secret,
+    }
+    resp = requests.post(url, headers=headers, json=body, timeout=10)
+    resp.raise_for_status()
+    return resp.json()["access_token"]
+
+
+def get_kis_access_token_cached(app_key: str, app_secret: str) -> str:
+    """
+    KIS 접근토큰을 파일로 캐시해 재사용한다.
+    23시간 이내 발급된 토큰이면 재사용하고, 그 이상 지났으면 새로 발급한다.
+    """
+    now = time.time()
+
+    if os.path.exists(_KIS_TOKEN_CACHE_PATH):
+        try:
+            with open(_KIS_TOKEN_CACHE_PATH, "r") as f:
+                cache = json.load(f)
+            if cache.get("app_key") == app_key and now - cache.get("issued_at", 0) < 23 * 3600:
+                return cache["access_token"]
+        except Exception:
+            pass
+
+    token = get_kis_access_token(app_key, app_secret)
+    try:
+        with open(_KIS_TOKEN_CACHE_PATH, "w") as f:
+            json.dump({"access_token": token, "issued_at": now, "app_key": app_key}, f)
+    except Exception:
+        pass  # 캐시 저장 실패해도 토큰 자체는 정상 반환
+
+    return token
+
+
+def ensure_kis_auth():
+    """
+    KIS_APP_KEY / KIS_APP_SECRET을 읽어 접근토큰을 준비한다.
+    없으면 사이드바에서 입력받고, 그래도 없으면 None을 반환한다
+    (이 경우 국내 ETF 시가총액은 결측으로 처리되고 나머지 기능은 정상 작동).
+    """
+    if USE_ENV_FILE:
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+        except ImportError:
+            pass
+
+    app_key = os.environ.get("KIS_APP_KEY")
+    app_secret = os.environ.get("KIS_APP_SECRET")
+
+    if not (app_key and app_secret):
+        with st.sidebar:
+            st.subheader("🔑 KIS(한국투자증권) API")
+            st.caption("국내 ETF 시가총액 조회에 사용됩니다. 입력하지 않아도 나머지 항목은 정상 작동합니다.")
+            app_key = st.text_input("KIS App Key", value=app_key or "", type="password")
+            app_secret = st.text_input("KIS App Secret", value=app_secret or "", type="password")
+
+    if not (app_key and app_secret):
+        return None
+
+    try:
+        access_token = get_kis_access_token_cached(app_key, app_secret)
+    except Exception as e:
+        st.sidebar.error(f"KIS 토큰 발급 실패: {e}")
+        return None
+
+    return {"access_token": access_token, "app_key": app_key, "app_secret": app_secret}
+
+
+def fetch_kis_market_caps(access_token: str, app_key: str, app_secret: str,
+                           tickers: list, delay: float = 0.15, progress_cb=None) -> dict:
+    """
+    KIS Open API로 전 종목 시가총액(억원)을 조회한다.
+    '국내주식 현재가 시세' API(FHKST01010100)의 hts_avls 필드가
+    이미 억원 단위로 계산된 시가총액이라 별도 계산 불필요 (Colab 검증 완료).
+    """
+    import requests
+
+    url = "https://openapi.koreainvestment.com:9443/uapi/domestic-stock/v1/quotations/inquire-price"
+    headers = {
+        "content-type": "application/json",
+        "authorization": f"Bearer {access_token}",
+        "appkey": app_key,
+        "appsecret": app_secret,
+        "tr_id": "FHKST01010100",
+    }
+
+    market_caps = {}
+    total = len(tickers)
+
+    for i, ticker in enumerate(tickers):
+        params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": ticker}
+        try:
+            resp = requests.get(url, headers=headers, params=params, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            avls = data.get("output", {}).get("hts_avls")
+            market_caps[ticker] = int(avls) if avls not in (None, "") else None
+        except Exception:
+            market_caps[ticker] = None
+
+        time.sleep(delay)
+
+        if progress_cb and (i + 1) % 50 == 0:
+            progress_cb(min(0.75 + 0.20 * (i + 1) / total, 0.95), f"시가총액 조회 중... {i + 1}/{total}")
+
+    return market_caps
+
+
+# ----------------------------------------------------------------------------
 # 공통 컬럼 정의
 # ----------------------------------------------------------------------------
 ETF_COLS = [
-    "종목코드", "ETF명", "시가총액\n(억원)", "주요 ETF\n(시총 1,000억↑)",
-    "안전자산", "월배당", "주가\n1개월", "주가\n6개월", "주가\nYTD", "주가\n1년",
-    "TR\n6개월", "TR\nYTD", "TR\n1년", "최근 1년\n분배율",
-    "운용사", "브랜드", "자산구분",
+    "종목코드", "ETF명", "시가총액(억원)", "PR\n1개월", "PR\n6개월", "PR\nYTD", "PR\n1년",
+    "최근 1년\n분배율",
 ]
 
 STOCK_COLS_KR = [
-    "종목코드", "종목명", "시가총액(억원)", "주가\n1년", "PR\n6개월", "PR\nYTD", "PR\n1년",
-    "최근 1년\n배당수익률", "운용사", "브랜드", "자산구분",
+    "종목코드", "종목명", "시가총액(억원)", "현재가", "PR\n1개월", "PR\n6개월", "PR\nYTD", "PR\n1년",
+    "최근 1년\n배당수익률",
 ]
 
 STOCK_COLS_US = [
-    "종목코드", "종목명", "시가총액(Mil)", "주가\n1년", "PR\n6개월", "PR\nYTD", "PR\n1년",
-    "최근 1년\n배당수익률", "운용사", "브랜드", "자산구분",
+    "종목코드", "종목명", "시가총액(Mil)", "현재가", "PR\n1개월", "PR\n6개월", "PR\nYTD", "PR\n1년",
+    "최근 1년\n배당수익률",
 ]
 
 
@@ -101,12 +228,7 @@ def _has_valid_close(df: pd.DataFrame) -> bool:
 
 def nearest_trading_day_close(get_ohlcv_by_ticker_func, target_date: dt.date, max_back: int = 10, retries: int = 2):
     """target_date부터 최대 max_back일 전까지 뒤로 훑으며
-    실제 거래가 있었던(종가가 0이 아닌) 전종목 스냅샷과 그 날짜를 반환.
-
-    pykrx는 KRX 서버 상태에 따라 정상 영업일에도 간헐적으로 빈 결과를
-    반환하는 경우가 있어(네트워크 지연 등), 같은 날짜에 대해 재시도한다.
-    또한 공휴일에는 종목은 존재하되 가격이 전부 0인 DataFrame이 반환될 수
-    있으므로, 종가가 실제로 0보다 큰 값이 있는지까지 확인한다."""
+    실제 거래가 있었던(종가가 0이 아닌) 전종목 스냅샷과 그 날짜를 반환."""
     d = target_date
     for _ in range(max_back):
         date_str = d.strftime("%Y%m%d")
@@ -119,15 +241,45 @@ def nearest_trading_day_close(get_ohlcv_by_ticker_func, target_date: dt.date, ma
             if _has_valid_close(df):
                 return df, date_str
             if attempt < retries:
-                time.sleep(0.5)  # 짧게 쉬었다가 같은 날짜 재시도
+                time.sleep(0.5)
         d -= dt.timedelta(days=1)
     return pd.DataFrame(), None
 
 
 # ----------------------------------------------------------------------------
+# pykrx ETF 종목명 안전 조회
+#
+# 원인: 2026-05-27 상장된 단일종목 레버리지/인버스 ETF·ETN 18개 종목이
+# KRX 원본 데이터 오류로 ELW 목록에도 중복 등재되어 있음(Colab에서 실제 KRX API
+# 응답으로 확인, pykrx 원본 함수가 아니라 KRX 데이터 자체의 결함).
+# pykrx의 EtxTicker.get_name()은 중복 인덱스일 때 str이 아닌 pandas.Series를
+# 반환해 str() 변환 시 지저분한 다중행 텍스트가 나옴.
+# ----------------------------------------------------------------------------
+def get_etf_ticker_name_safe(ticker: str) -> str:
+    from pykrx.website.krx.etx.ticker import EtxTicker
+
+    df = EtxTicker().df
+
+    if ticker not in df.index:
+        return None
+
+    rows = df.loc[[ticker]]
+
+    if len(rows) == 1:
+        return str(rows.iloc[0]["종목명"])
+
+    # 중복인 경우: ETF/ETN 카테고리 우선 (KRX 데이터 중복 등재 시 ELW가 아닌 쪽 선택)
+    preferred = rows[rows["시장"].isin(["ETF", "ETN"])]
+    if len(preferred) > 0:
+        return str(preferred.iloc[0]["종목명"])
+
+    return str(rows.iloc[0]["종목명"])
+
+
+# ----------------------------------------------------------------------------
 # 1번 시트: 국내 상장 ETF 전체
 # ----------------------------------------------------------------------------
-def build_domestic_etf_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFrame:
+def build_domestic_etf_sheet(base_date: dt.date, progress_cb=None, kis_auth=None) -> pd.DataFrame:
     from pykrx import stock
 
     def snap(date_obj):
@@ -140,30 +292,42 @@ def build_domestic_etf_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFra
         raise RuntimeError("기준일 근처에 ETF 시세 데이터가 없습니다. 날짜를 확인해 주세요.")
 
     if progress_cb:
-        progress_cb(0.20, "1개월 전 시세 조회 중...")
+        progress_cb(0.15, "1개월 전 시세 조회 중...")
     m1_df, _ = snap(base_date - dt.timedelta(days=30))
 
     if progress_cb:
-        progress_cb(0.35, "6개월 전 시세 조회 중...")
+        progress_cb(0.30, "6개월 전 시세 조회 중...")
     m6_df, _ = snap(base_date - dt.timedelta(days=182))
 
     if progress_cb:
-        progress_cb(0.50, "1년 전 시세 조회 중...")
+        progress_cb(0.45, "1년 전 시세 조회 중...")
     y1_df, _ = snap(base_date - dt.timedelta(days=365))
 
     if progress_cb:
-        progress_cb(0.60, "연초(YTD) 시세 조회 중...")
+        progress_cb(0.55, "연초(YTD) 시세 조회 중...")
     ytd_df, _ = snap(dt.date(base_date.year, 1, 1))
 
     if progress_cb:
-        progress_cb(0.70, "종목명 매핑 중...")
+        progress_cb(0.65, "종목명 매핑 중...")
     tickers = stock.get_etf_ticker_list(today_str)
     name_map = {}
     for code in tickers:
         try:
-            name_map[code] = stock.get_etf_ticker_name(code)
+            name_map[code] = get_etf_ticker_name_safe(code)
         except Exception:
             name_map[code] = None
+
+    market_cap_map = {}
+    if kis_auth:
+        if progress_cb:
+            progress_cb(0.75, f"시가총액 조회 중 (KIS API, {len(tickers)}종목, 수 분 소요)...")
+        try:
+            market_cap_map = fetch_kis_market_caps(
+                kis_auth["access_token"], kis_auth["app_key"], kis_auth["app_secret"],
+                tickers, progress_cb=progress_cb,
+            )
+        except Exception:
+            market_cap_map = {}  # 실패 시 시가총액은 결측 처리, 나머지 컬럼은 정상 진행
 
     def ret(df_ref, code, close_now):
         if df_ref is None or df_ref.empty or code not in df_ref.index:
@@ -179,24 +343,12 @@ def build_domestic_etf_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFra
         rows.append({
             "종목코드": code,
             "ETF명": name_map.get(code),
-            # pykrx의 ETF 관련 함수(get_etf_ohlcv_by_ticker 등)는 시가총액을 제공하지 않음
-            # (get_market_cap 계열은 일반 주식 전용이며 ETF 종목코드는 포함하지 않음, Colab 검증 완료)
-            # → 시가총액/주요ETF 여부는 자동 산출하지 않고 빈칸으로 둠
-            "시가총액\n(억원)": None,
-            "주요 ETF\n(시총 1,000억↑)": None,
-            "안전자산": None,
-            "월배당": None,
-            "주가\n1개월": ret(m1_df, code, close_now),
-            "주가\n6개월": ret(m6_df, code, close_now),
-            "주가\nYTD": ret(ytd_df, code, close_now),
-            "주가\n1년": ret(y1_df, code, close_now),
-            "TR\n6개월": None,
-            "TR\nYTD": None,
-            "TR\n1년": None,
-            "최근 1년\n분배율": None,
-            "운용사": None,
-            "브랜드": None,
-            "자산구분": None,
+            "시가총액(억원)": market_cap_map.get(code),
+            "PR\n1개월": ret(m1_df, code, close_now),
+            "PR\n6개월": ret(m6_df, code, close_now),
+            "PR\nYTD": ret(ytd_df, code, close_now),
+            "PR\n1년": ret(y1_df, code, close_now),
+            "최근 1년\n분배율": None,  # 소스 미확보, 보류 (KIS API에도 해당 필드 없음, 2026-08-28 확인)
         })
 
     if progress_cb:
@@ -222,32 +374,36 @@ def build_kospi200_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFrame:
         )
 
     if progress_cb:
-        progress_cb(0.20, "기준일 시세 조회 중...")
+        progress_cb(0.15, "기준일 시세 조회 중...")
     today_df, today_str = snap(base_date)
     if today_df.empty:
         raise RuntimeError("기준일 근처에 주식 시세 데이터가 없습니다. 날짜를 확인해 주세요.")
 
     if progress_cb:
-        progress_cb(0.35, "6개월 전 시세 조회 중...")
+        progress_cb(0.25, "1개월 전 시세 조회 중...")
+    m1_df, _ = snap(base_date - dt.timedelta(days=30))
+
+    if progress_cb:
+        progress_cb(0.40, "6개월 전 시세 조회 중...")
     m6_df, _ = snap(base_date - dt.timedelta(days=182))
 
     if progress_cb:
-        progress_cb(0.50, "1년 전 시세 조회 중...")
+        progress_cb(0.55, "1년 전 시세 조회 중...")
     y1_df, _ = snap(base_date - dt.timedelta(days=365))
 
     if progress_cb:
-        progress_cb(0.60, "연초(YTD) 시세 조회 중...")
+        progress_cb(0.65, "연초(YTD) 시세 조회 중...")
     ytd_df, _ = snap(dt.date(base_date.year, 1, 1))
 
     if progress_cb:
-        progress_cb(0.70, "배당수익률(DIV) 조회 중...")
+        progress_cb(0.75, "배당수익률(DIV) 조회 중...")
     try:
         fund_df = stock.get_market_fundamental(today_str, market="ALL")
     except Exception:
         fund_df = pd.DataFrame()
 
     if progress_cb:
-        progress_cb(0.80, "종목명 매핑 중...")
+        progress_cb(0.85, "종목명 매핑 중...")
     name_map = {}
     for code in codes:
         try:
@@ -256,7 +412,7 @@ def build_kospi200_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFrame:
             name_map[code] = None
 
     if progress_cb:
-        progress_cb(0.85, "시가총액 조회 중...")
+        progress_cb(0.90, "시가총액 조회 중...")
     try:
         cap_df = stock.get_market_cap(today_str, market="ALL")
     except Exception:
@@ -276,6 +432,7 @@ def build_kospi200_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFrame:
             continue
         close_now = today_df.loc[code, "종가"]
 
+        pr1m = ret(m1_df, code, close_now)
         pr6m = ret(m6_df, code, close_now)
         pr_ytd = ret(ytd_df, code, close_now)
         pr1y = ret(y1_df, code, close_now)
@@ -287,27 +444,24 @@ def build_kospi200_sheet(base_date: dt.date, progress_cb=None) -> pd.DataFrame:
 
         market_cap = None
         if not cap_df.empty and code in cap_df.index:
-            cap_val = cap_df.loc[code, "시가총액"]  # pykrx 원 단위 값
-            market_cap = round(cap_val / 1e8) if pd.notna(cap_val) else None  # 억원 단위로 환산
+            cap_val = cap_df.loc[code, "시가총액"]
+            market_cap = round(cap_val / 1e8) if pd.notna(cap_val) else None
 
         rows.append({
             "종목코드": code,
             "종목명": name_map.get(code),
             "시가총액(억원)": market_cap,
-            "주가\n1년": close_now,
+            "현재가": close_now,
+            "PR\n1개월": pr1m,
             "PR\n6개월": pr6m,
             "PR\nYTD": pr_ytd,
             "PR\n1년": pr1y,
             "최근 1년\n배당수익률": div_yield,
-            "운용사": None,
-            "브랜드": None,
-            "자산구분": None,
         })
 
     if progress_cb:
         progress_cb(1.0, "완료")
     out = pd.DataFrame(rows)[STOCK_COLS_KR]
-    # 시가총액 내림차순 정렬 (값이 없는 종목은 맨 뒤로)
     out = out.sort_values("시가총액(억원)", ascending=False, na_position="last").reset_index(drop=True)
     return out
 
@@ -361,10 +515,7 @@ def get_nasdaq100_tickers() -> pd.DataFrame:
 
 def _get_schd_nport_xml_url() -> str:
     """SCHWAB STRATEGIC TRUST(CIK 1454889)의 최신 NPORT-P 필링들 중
-    SCHD 시리즈(S000034163)에 해당하는 필링의 primary_doc.xml URL을 찾는다.
-
-    Schwab Strategic Trust는 여러 ETF(SCHD, SCHB, SCHX 등)를 한 CIK로 운용하므로,
-    최근 필링부터 순회하며 XML 안에 SCHD 시리즈ID가 포함된 첫 필링을 사용한다."""
+    SCHD 시리즈(S000034163)에 해당하는 필링의 primary_doc.xml URL을 찾는다."""
     import requests
 
     cik = "0001454889"  # SEC submissions API는 10자리 zero-padded CIK를 요구함
@@ -390,10 +541,8 @@ def _get_schd_nport_xml_url() -> str:
 
 
 def _cusip_to_ticker_batch(cusip_list, batch_size=10) -> dict:
-    """OpenFIGI API(무료, 키 불필요)로 CUSIP 리스트를 티커로 일괄 변환.
-    동일 CUSIP에 여러 거래소가 매칭되는 경우 미국 본토(exchCode='US')를 우선 선택한다."""
+    """OpenFIGI API(무료, 키 불필요)로 CUSIP 리스트를 티커로 일괄 변환."""
     import requests
-    import time
 
     results = {}
     for i in range(0, len(cusip_list), batch_size):
@@ -424,14 +573,8 @@ def _cusip_to_ticker_batch(cusip_list, batch_size=10) -> dict:
 def get_schd_holdings() -> pd.DataFrame:
     """SCHD(Schwab US Dividend Equity ETF) 구성종목.
 
-    Schwab 공식 홀딩스 페이지(schwabassetmanagement.com)는 Akamai 봇 방어벽으로 막혀 있고(403),
-    stockanalysis.com 등 무료 홀딩스 요약 페이지는 상위 25개 종목만 제공한다(SvelteKit
-    클라이언트 렌더링으로 전체 목록은 로그인 후에만 로드됨, Colab에서 확인됨).
-
-    대신 SEC EDGAR의 공식 규제 공시(Form N-PORT)에서 전체 보유종목(CUSIP 기준)을 가져오고,
-    OpenFIGI API로 CUSIP을 실제 매매 티커로 변환한다. 현금성 자산·선물 등 개별 종목이 아닌
-    항목(유효한 CUSIP이 없는 경우)은 자동으로 제외되며, 최종적으로 약 99개 종목이 남는다
-    (SCHD는 100종목 인덱스를 추종하되 실제 운용상 100개에서 소폭 차이가 날 수 있음)."""
+    SEC EDGAR의 공식 규제 공시(Form N-PORT)에서 전체 보유종목(CUSIP 기준)을 가져오고,
+    OpenFIGI API로 CUSIP을 실제 매매 티커로 변환한다."""
     xml_url = _get_schd_nport_xml_url()
 
     import requests
@@ -473,7 +616,9 @@ def get_schd_holdings() -> pd.DataFrame:
 
 
 def calc_us_stock_metrics(ticker: str) -> dict:
-    """yfinance로 미국 종목의 주가/PR/배당수익률 계산."""
+    """yfinance로 미국 종목의 시가총액/주가/PR/배당수익률 계산.
+    시가총액은 fast_info를 우선 사용(info보다 안정적, Colab에서 결측 9→0건으로 개선 확인),
+    실패 시 info로 폴백한다."""
     import yfinance as yf
 
     try:
@@ -499,6 +644,7 @@ def calc_us_stock_metrics(ticker: str) -> dict:
             sub2 = hist[hist.index >= ytd_start]
             return sub2["Close"].iloc[0] if not sub2.empty else None
 
+        p1m = price_n_days_ago(30)
         p6m = price_n_days_ago(182)
         p1y = price_n_days_ago(365)
         p_ytd = price_at_ytd_start()
@@ -520,15 +666,24 @@ def calc_us_stock_metrics(ticker: str) -> dict:
 
         market_cap = None
         try:
-            info = t.info
-            raw_cap = info.get("marketCap")  # yfinance는 원(raw dollar) 단위로 반환
-            market_cap = round(raw_cap / 1e6) if raw_cap else None  # 백만달러(Mil) 단위로 환산
+            fi = t.fast_info
+            raw_cap = fi.get("marketCap") or fi.get("market_cap")
+            if raw_cap:
+                market_cap = round(raw_cap / 1e6)
         except Exception:
             pass
+        if market_cap is None:
+            try:
+                info = t.info
+                raw_cap = info.get("marketCap")
+                market_cap = round(raw_cap / 1e6) if raw_cap else None
+            except Exception:
+                pass
 
         return {
             "시가총액(Mil)": market_cap,
-            "주가\n1년": round(float(last_close), 2),
+            "현재가": round(float(last_close), 2),
+            "PR\n1개월": pr(p1m),
             "PR\n6개월": pr(p6m),
             "PR\nYTD": pr(p_ytd),
             "PR\n1년": pr(p1y),
@@ -551,13 +706,10 @@ def process_us_stock_sheet(label, ticker_df_func, progress_cb=None, limit=None) 
             progress_cb(min((i + 1) / n, 1.0), f"{label} {i + 1}/{n}")
         time.sleep(0.05)  # yfinance 과호출 방지
     out = pd.DataFrame(rows)
-    for c in ["운용사", "브랜드", "자산구분"]:
-        out[c] = None
     for c in STOCK_COLS_US:
         if c not in out.columns:
             out[c] = None
     out = out[STOCK_COLS_US]
-    # 시가총액 내림차순 정렬 (값이 없는 종목은 맨 뒤로)
     out = out.sort_values("시가총액(Mil)", ascending=False, na_position="last").reset_index(drop=True)
     return out
 
@@ -565,7 +717,7 @@ def process_us_stock_sheet(label, ticker_df_func, progress_cb=None, limit=None) 
 # ----------------------------------------------------------------------------
 # 엑셀 숫자 표기 프로토콜
 #   - 비율(PR, 배당수익률 등): %, 소수점 2자리, 음수는 빨간색
-#   - 일반 숫자(시가총액, 주가 등): 1000단위 콤마, 음수는 빨간색
+#   - 일반 숫자(시가총액, 현재가 등): 1000단위 콤마, 음수는 빨간색
 #   - 셀에 저장되는 실제 값은 그대로 숫자이며, 아래는 "표시 형식"만 지정한다
 #     (정렬·필터·수식은 서식과 무관하게 정상 동작)
 #
@@ -580,21 +732,17 @@ PERCENT_FORMAT = '0.00%;[Red]-0.00%'
 NUMBER_FORMAT = '#,##0;[Red]-#,##0'
 
 # 컬럼명에 아래 키워드가 포함되면 비율(%) 서식, 나머지 숫자형 컬럼은 콤마 서식으로 처리
-PERCENT_KEYWORDS = ["주가", "TR", "PR", "배당", "분배율", "괴리율", "등락률"]
+PERCENT_KEYWORDS = ["TR", "PR", "배당", "분배율", "괴리율", "등락률"]
 # 서식을 적용하지 않을 텍스트성 컬럼(그대로 둠)
-TEXT_COLUMNS = {"종목코드", "ETF명", "종목명", "운용사", "브랜드", "자산구분",
-                "안전자산", "월배당", "주요 ETF\n(시총 1,000억↑)"}
+TEXT_COLUMNS = {"종목코드", "ETF명", "종목명"}
 
 HEADER_ROW = 3        # 컬럼명이 들어가는 행
 DATA_START_ROW = 4    # 데이터가 시작되는 행
 
 
 def _is_percent_column(col_name: str) -> bool:
-    # "시가총액", "주가\n1년"처럼 순수 가격/금액 컬럼은 비율이 아니므로 제외
+    # "시가총액"처럼 순수 금액 컬럼은 비율이 아니므로 제외
     if "시가총액" in col_name:
-        return False
-    if col_name.strip() in ("주가\n1년",) or col_name == "주가(1년)":
-        # "주가 1년"은 가격 그 자체(숫자)이지 등락률이 아님 → 콤마 서식
         return False
     return any(kw in col_name for kw in PERCENT_KEYWORDS)
 
@@ -603,7 +751,6 @@ def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame):
     """시트 하나를 제목/빈줄/헤더/데이터 구조로 작성하고,
     숫자 서식·헤더 굵게·자동 필터·틀고정·열 너비까지 한 번에 적용한다."""
     safe_name = sheet_name[:31]
-    # 실제 데이터는 DATA_START_ROW부터 쓰기 위해 헤더 없이 먼저 기록
     df.to_excel(writer, sheet_name=safe_name, index=False, header=False, startrow=DATA_START_ROW - 1)
     ws = writer.sheets[safe_name]
 
@@ -654,15 +801,15 @@ def write_formatted_sheet(writer, sheet_name: str, df: pd.DataFrame):
 # ----------------------------------------------------------------------------
 # Streamlit UI
 # ----------------------------------------------------------------------------
-st.title("📊 ETF/종목 리스트 자동 업데이트 (pykrx 단독 버전)")
+st.title("📊 ETF/종목 리스트 자동 업데이트 (pykrx + KIS API 버전)")
 st.caption("국내 ETF / KOSPI200 / S&P500 / 나스닥100 / SCHD 구성종목")
 
 st.markdown(
     """
 **데이터 소스**
-- 국내(1, 2번): `pykrx` — 전종목 일괄조회 함수로 처리 (종목별 반복호출 없음, 빠름)
-- 미국(4, 5, 6번): `yfinance` + 위키피디아/Schwab 구성종목표
-- PR(주가수익률) 6개월/YTD/1년, 최근 1년 배당수익률을 각각 컬럼으로 제공
+- 국내(1, 2번): `pykrx` (전종목 일괄조회, 종목별 반복호출 없음) + 국내 ETF 시가총액은 KIS Open API
+- 미국(4, 5, 6번): `yfinance` + 위키피디아 / SEC EDGAR 구성종목표
+- PR(주가수익률) 1개월/6개월/YTD/1년, 최근 1년 배당수익률을 각각 컬럼으로 제공
 """
 )
 
@@ -670,6 +817,10 @@ login_ok = ensure_krx_login()
 if not login_ok:
     st.warning("좌측 사이드바에 KRX 아이디/비밀번호를 입력해야 국내(1, 2번) 시트를 조회할 수 있습니다. "
                "(미국 시트만 쓸 경우엔 입력하지 않아도 됩니다.)")
+
+kis_auth = ensure_kis_auth()
+if not kis_auth:
+    st.info("KIS App Key/Secret이 없어 국내 ETF 시가총액은 결측으로 처리됩니다. (나머지 항목은 정상)")
 
 base_date = st.date_input("기준일", value=dt.date.today() - dt.timedelta(days=1))
 
@@ -697,7 +848,7 @@ if run:
             def cb(p, msg):
                 bar.progress(p)
                 status.text(msg)
-            out = build_domestic_etf_sheet(base_date, progress_cb=cb)
+            out = build_domestic_etf_sheet(base_date, progress_cb=cb, kis_auth=kis_auth)
             result_sheets["국내 상장 ETF"] = out
             st.success(f"국내 ETF {len(out)}종목 완료")
         except Exception as e:
